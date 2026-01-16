@@ -39,10 +39,15 @@ function openai_groq_openai_provider_settings_alter(&$settings, $context) {
 
   $available_keys = function_exists('key_get_key_names_as_options') ? key_get_key_names_as_options() : [];
 
+  // Read central providers mapping so the provider's key_select shows the
+  // currently configured key as the default value.
+  $providers_root = config_get('openai.settings', 'providers') ?: [];
+  $default_key = !empty($providers_root['groq']['api_key']) ? $providers_root['groq']['api_key'] : '';
+
   $settings['api_key_groq'] = [
     '#type' => 'key_select',
     '#title' => t('Groq API Key'),
-    '#default_value' => config_get('openai.settings', 'api_key_groq') ?: '',
+    '#default_value' => $default_key,
     '#options' => $available_keys,
     '#key_filters' => ['type' => 'authentication'],
     // Use direct string for URL to avoid t() file resolution warning

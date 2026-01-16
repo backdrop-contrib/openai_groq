@@ -26,7 +26,11 @@ else {
 
 use OpenAI\Client as OpenAIClient;
 use OpenAI\Exceptions\TransporterException;
-use Symfony\Component\HttpFoundation\StreamedResponse;
+
+/**
+ * Avoid depending on Symfony's StreamedResponse; use minimal anonymous
+ * streaming objects with a send() method to keep adapters self-contained.
+ */
 
 class GroqAdapter implements AIClientInterface {
   protected $client;
@@ -193,39 +197,37 @@ class GroqAdapter implements AIClientInterface {
 
   // ------------------------ Text / Chat ------------------------
   public function completions(string $model, string $prompt, $temperature, $max_tokens = 512, bool $stream_response = FALSE) {
-    try {
-      $payload = [
-        'model' => $model,
-        'prompt' => trim($prompt),
-        'temperature' => (float) $temperature,
-      ];
+    $start_time = microtime(TRUE);
+     try {
+       $payload = [
+         'model' => $model,
+         'prompt' => trim($prompt),
+         'temperature' => (float) $temperature,
+       ];
 
-      if ((int) $max_tokens > 0) {
-        $payload['max_tokens'] = (int) $max_tokens;
-      }
+       if ((int) $max_tokens > 0) {
+         $payload['max_tokens'] = (int) $max_tokens;
+       }
 
-      if ($stream_response) {
+       if ($stream_response) {
         // Try SDK streamed path if available
         try {
           $stream = $this->client->completions()->createStreamed($payload);
-          return new StreamedResponse(function () use ($stream) {
-            foreach ($stream as $data) {
-              $text = $data->choices[0]->delta->content ?? $data->choices[0]->text ?? '';
-              if ($text !== '') {
-                echo $text;
-                @ob_flush(); @flush();
+          return new class($stream) {
+            protected $stream;
+            public function __construct($stream) { $this->stream = $stream; }
+            public function send() {
+              foreach ($this->stream as $data) {
+                $text = $data->choices[0]->delta->content ?? $data->choices[0]->text ?? '';
+                if ($text !== '') { echo $text; @ob_flush(); @flush(); }
               }
             }
-          }, 200, [
-            'Cache-Control' => 'no-cache, must-revalidate',
-            'Content-Type' => 'text/event-stream',
-            'X-Accel-Buffering' => 'no',
-          ]);
-        }
-        catch (\Throwable $e) {
-          // Fall back to non-streaming below
-        }
-      }
+          };
+         }
+         catch (\Throwable $e) {
+           // Fall back to non-streaming below
+         }
+       }
 
       // Non-streaming path: use SDK if possible, otherwise curl.
       try {
@@ -234,7 +236,8 @@ class GroqAdapter implements AIClientInterface {
           $resp = $resp->toArray();
         }
         // Normalized location for text
-        return trim($resp['choices'][0]['text'] ?? $resp['choices'][0]['message']['content'] ?? '');
+        $out_text = trim($resp['choices'][0]['text'] ?? $resp['choices'][0]['message']['content'] ?? '');
+        return $out_text;
       }
       catch (\Exception $e) {
         // As a last resort, use curl with the real API key.
@@ -256,7 +259,8 @@ class GroqAdapter implements AIClientInterface {
         curl_close($ch);
         if ($http_code == 200) {
           $decoded = json_decode($response, TRUE);
-          return trim($decoded['choices'][0]['text'] ?? $decoded['choices'][0]['message']['content'] ?? '');
+          $out_text = trim($decoded['choices'][0]['text'] ?? $decoded['choices'][0]['message']['content'] ?? '');
+          return $out_text;
         }
         throw new \Exception('HTTP ' . $http_code . ': ' . substr((string)$response, 0, 500));
       }
@@ -268,7 +272,8 @@ class GroqAdapter implements AIClientInterface {
   }
 
   public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE) {
-    try {
+    $start_time = microtime(TRUE);
+     try {
       $payload = [
         'model' => $model,
         'messages' => $messages,
@@ -283,19 +288,17 @@ class GroqAdapter implements AIClientInterface {
       if ($stream_response) {
         try {
           $stream = $this->client->chat()->createStreamed($payload);
-          return new StreamedResponse(function () use ($stream) {
-            foreach ($stream as $data) {
-              $text = $data->choices[0]->delta->content ?? $data->choices[0]->message->content ?? $data->choices[0]->text ?? '';
-              if ($text !== '') {
-                echo $text;
-                @ob_flush(); @flush();
+          $streamed = new class($stream) {
+            protected $stream;
+            public function __construct($stream) { $this->stream = $stream; }
+            public function send() {
+              foreach ($this->stream as $data) {
+                $text = $data->choices[0]->delta->content ?? $data->choices[0]->message->content ?? $data->choices[0]->text ?? '';
+                if ($text !== '') { echo $text; @ob_flush(); @flush(); }
               }
             }
-          }, 200, [
-            'Cache-Control' => 'no-cache, must-revalidate',
-            'Content-Type' => 'text/event-stream',
-            'X-Accel-Buffering' => 'no',
-          ]);
+          };
+         return $streamed;
         }
         catch (\Throwable $e) {
           // Fall through to curl-based fallback below.
@@ -308,7 +311,8 @@ class GroqAdapter implements AIClientInterface {
         if (method_exists($resp, 'toArray')) {
           $resp = $resp->toArray();
         }
-        return trim($resp['choices'][0]['message']['content'] ?? $resp['choices'][0]['text'] ?? '');
+        $out_text = trim($resp['choices'][0]['message']['content'] ?? $resp['choices'][0]['text'] ?? '');
+        return $out_text;
       }
       catch (\Exception $e) {
         // SDK likely cannot reach Groq's OpenAI-incompatible chat endpoint.
@@ -423,72 +427,76 @@ class GroqAdapter implements AIClientInterface {
             // Choose the appropriate payload for chat vs prompt endpoints
             $request_payload = (stripos($url, '/chat/') !== FALSE || stripos($url, '/chat.completions') !== FALSE) ? $chat_payload : $body;
 
-            return new StreamedResponse(function () use ($url, $request_payload) {
-              $ch = curl_init($url);
-              $payload = json_encode($request_payload);
-              curl_setopt($ch, CURLOPT_POST, TRUE);
-              curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-              curl_setopt($ch, CURLOPT_RETURNTRANSFER, FALSE);
-              curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
-                $parts = preg_split('/\r?\n\r?\n/', $data);
-                foreach ($parts as $part) {
-                  $part = trim($part);
-                  if ($part === '') { continue; }
-                  $part = preg_replace('/^data:\s*/m', '', $part);
-                  $decoded = json_decode($part, TRUE);
-                  $sent = '';
-                  if (is_array($decoded)) {
-                    if (!empty($decoded['outputs']) && is_array($decoded['outputs'])) {
-                      $out = $decoded['outputs'][0] ?? NULL;
-                      if (is_string($out)) { $sent = $out; }
-                      elseif (is_array($out)) { $sent = $out['content'] ?? $out['text'] ?? $out['output'] ?? json_encode($out); }
-                    }
-                    elseif (!empty($decoded['choices']) && is_array($decoded['choices'])) {
-                      $choice = $decoded['choices'][0] ?? [];
-                      $sent = $choice['delta']['content'] ?? $choice['message']['content'] ?? $choice['text'] ?? '';
-                    }
-                    elseif (!empty($decoded['data']) && is_array($decoded['data'])) {
-                      $d = $decoded['data'][0] ?? [];
-                      if (is_array($d)) { $sent = $d['content'] ?? $d['text'] ?? ''; }
-                    }
-                  }
-                  else { $sent = $part; }
-
-                  if ($sent !== '') { echo $sent; @ob_flush(); @flush(); }
-                }
-                return strlen($data);
-              });
-              curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                'Content-Type: application/json',
-                'Accept: text/event-stream, application/json',
-                'Authorization: Bearer ' . $this->realApiKey,
-                'Referer: ' . url('<front>', ['absolute' => TRUE]),
-                'X-Title: ' . (config_get('system.core', 'site_name') ?: 'Backdrop CMS'),
-              ]);
-              curl_setopt($ch, CURLOPT_TIMEOUT, 0);
-              curl_setopt($ch, CURLOPT_BUFFERSIZE, 1024);
-              $ok = @curl_exec($ch);
-              if ($ok === FALSE) {
-                $err = curl_error($ch);
-                curl_close($ch);
-                watchdog('openai_groq', 'Groq streaming curl error on @url: @error', ['@url' => $url, '@error' => $err], WATCHDOG_WARNING);
-                echo '';
+            return new class($url, $request_payload) {
+              protected $url;
+              protected $request_payload;
+              public function __construct($url, $request_payload) {
+                $this->url = $url;
+                $this->request_payload = $request_payload;
               }
-              else { curl_close($ch); }
-            }, 200, [
-              'Cache-Control' => 'no-cache, must-revalidate',
-              'Content-Type' => 'text/event-stream',
-              'X-Accel-Buffering' => 'no',
-            ]);
+              public function send() {
+                $ch = curl_init($this->url);
+                $payload = json_encode($this->request_payload);
+                curl_setopt($ch, CURLOPT_POST, TRUE);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, FALSE);
+                curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
+                  $parts = preg_split('/\r?\n\r?\n/', $data);
+                  foreach ($parts as $part) {
+                    $part = trim($part);
+                    if ($part === '') { continue; }
+                    $part = preg_replace('/^data:\s*/m', '', $part);
+                    $decoded = json_decode($part, TRUE);
+                    $sent = '';
+                    if (is_array($decoded)) {
+                      if (!empty($decoded['outputs']) && is_array($decoded['outputs'])) {
+                        $out = $decoded['outputs'][0] ?? NULL;
+                        if (is_string($out)) { $sent = $out; }
+                        elseif (is_array($out)) { $sent = $out['content'] ?? $out['text'] ?? $out['output'] ?? json_encode($out); }
+                      }
+                      elseif (!empty($decoded['choices']) && is_array($decoded['choices'])) {
+                        $choice = $decoded['choices'][0] ?? [];
+                        $sent = $choice['delta']['content'] ?? $choice['message']['content'] ?? $choice['text'] ?? '';
+                      }
+                      elseif (!empty($decoded['data']) && is_array($decoded['data'])) {
+                        $d = $decoded['data'][0] ?? [];
+                        if (is_array($d)) { $sent = $d['content'] ?? $d['text'] ?? ''; }
+                      }
+                    }
+                    else { $sent = $part; }
+
+                    if ($sent !== '') { echo $sent; @ob_flush(); @flush(); }
+                  }
+                  return strlen($data);
+                });
+                curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                  'Content-Type: application/json',
+                  'Accept: text/event-stream, application/json',
+                  'Authorization: Bearer ' . $this->realApiKey,
+                  'Referer: ' . url('<front>', ['absolute' => TRUE]),
+                  'X-Title: ' . (config_get('system.core', 'site_name') ?: 'Backdrop CMS'),
+                ]);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+                curl_setopt($ch, CURLOPT_BUFFERSIZE, 1024);
+                $ok = @curl_exec($ch);
+                if ($ok === FALSE) {
+                  $err = curl_error($ch);
+                  curl_close($ch);
+                  watchdog('openai_groq', 'Groq streaming curl error on @url: @error', ['@url' => $this->url, '@error' => $err], WATCHDOG_WARNING);
+                  echo '';
+                }
+                else { curl_close($ch); }
+              }
+            };
           }
           catch (\Exception $e) {
             // Try next candidate
             watchdog('openai_groq', 'Streaming candidate failed @url: @msg', ['@url' => $url, '@msg' => $e->getMessage()], WATCHDOG_DEBUG);
             continue;
           }
-        }
-        // If we reached here, streaming failed for all candidates; fall through to non-streaming
-      }
+         }
+         // If we reached here, streaming failed for all candidates; fall through to non-streaming
+       }
 
       // Non-streaming: try candidates in order and return the first successful normalized text
       foreach ($candidates as $url) {
@@ -541,7 +549,7 @@ class GroqAdapter implements AIClientInterface {
       return '';
     }
     catch (TransporterException | \Exception $e) {
-      watchdog('openai_groq', 'Groq chat error: @error', ['@error' => $e->getMessage()], WATCHDOG_ERROR);
+      watchdog('openai_groq', 'Groq completions error: @error', ['@error' => $e->getMessage()], WATCHDOG_ERROR);
       return '';
     }
   }
@@ -552,7 +560,7 @@ class GroqAdapter implements AIClientInterface {
     return ['data' => []];
   }
 
-  public function moderation(string $input, ?string $model = NULL): array {
+  public function moderation(string $input, string $model = 'omni-moderation-latest'): array {
     // Not supported by Groq at this time
     return [];
   }
@@ -562,7 +570,7 @@ class GroqAdapter implements AIClientInterface {
     return $this->embedding((string)$input, $model);
   }
 
-  public function embedding(string $input, string $model): array {
+  public function embedding(string $input, string $model, bool $log = TRUE): array {
     try {
       // Attempt SDK path
       $resp = $this->client->embeddings()->create([
