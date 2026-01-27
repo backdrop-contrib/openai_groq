@@ -652,8 +652,8 @@ class GroqAdapter implements AIClientInterface {
       }
       if ($log) {
         $error_msg = $e->getMessage();
-        // Suppress log if it's a "does not support embeddings" or similar during probing.
-        if (stripos($error_msg, 'does not support embeddings') === FALSE && stripos($error_msg, 'not found') === FALSE) {
+        // Suppress log if it's a "does not support embeddings" during probing.
+        if (stripos($error_msg, 'does not support embeddings') === FALSE) {
           watchdog('openai_groq', 'Groq embedding error: @error', ['@error' => $error_msg], WATCHDOG_WARNING);
         }
       }
