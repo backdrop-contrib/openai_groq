@@ -578,11 +578,67 @@ class GroqAdapter implements AIClientInterface {
         'model' => $model,
         'input' => $input,
       ]);
-      $result = [];
-      if (method_exists($resp, 'toArray')) {
+
+      // Preserve raw response for logging.
+      $raw_resp = $resp;
+
+      // Normalize $resp into an array $result regardless of shape:
+      // - object with toArray()
+      // - array already
+      // - JSON string
+      // - generic object (convert via json encode/decode)
+      $result = null;
+      if (is_object($resp) && method_exists($resp, 'toArray')) {
         $result = $resp->toArray();
       }
-      $vector = $result['data'][0]['embedding'] ?? [];
+      elseif (is_array($resp)) {
+        $result = $resp;
+      }
+      elseif (is_string($resp)) {
+        $decoded = json_decode($resp, TRUE);
+        if (json_last_error() === JSON_ERROR_NONE) {
+          $result = $decoded;
+        }
+        else {
+          $result = ['raw' => $resp];
+        }
+      }
+      elseif (is_object($resp)) {
+        $result = json_decode(json_encode($resp), TRUE);
+      }
+      else {
+        $result = ['raw' => $resp];
+      }
+
+      // Attempt to extract embedding vector from a variety of possible shapes.
+      $vector = [];
+      if (!empty($result['data']) && is_array($result['data'])) {
+        $first = $result['data'][0] ?? [];
+        if (is_array($first) && isset($first['embedding'])) {
+          $vector = $first['embedding'];
+        }
+        elseif (is_array($first) && isset($first['vector'])) {
+          $vector = $first['vector'];
+        }
+      }
+      if (empty($vector) && isset($result['embedding'])) {
+        $vector = $result['embedding'];
+      }
+      if (empty($vector) && isset($result['vectors']) && is_array($result['vectors'])) {
+        $vector = $result['vectors'][0] ?? [];
+      }
+
+      // If extraction failed, log failure with raw response context.
+      if (empty($vector) || !is_array($vector)) {
+        if (isset($this->api) && method_exists($this->api, 'recordLog')) {
+          $duration = microtime(TRUE) - $start_time;
+          $log_payload = $result ?? ['raw' => is_scalar($raw_resp) ? $raw_resp : json_decode(json_encode($raw_resp), TRUE)];
+          $this->api->recordLog('embedding', $model, ['input' => $input], $log_payload, FALSE, $duration, 'Failed to extract embedding vector from response', !$log);
+        }
+        return [];
+      }
+
+      // Success: record normalized result and return vector.
       if (isset($this->api) && method_exists($this->api, 'recordLog')) {
         $duration = microtime(TRUE) - $start_time;
         $this->api->recordLog('embedding', $model, ['input' => $input], $result, TRUE, $duration, NULL, !$log);
@@ -597,7 +653,7 @@ class GroqAdapter implements AIClientInterface {
       if ($log) {
         $error_msg = $e->getMessage();
         // Suppress log if it's a "does not support embeddings" or similar during probing.
-        if (strpos($error_msg, 'does not support embeddings') === FALSE && strpos($error_msg, 'not found') === FALSE) {
+        if (stripos($error_msg, 'does not support embeddings') === FALSE && stripos($error_msg, 'not found') === FALSE) {
           watchdog('openai_groq', 'Groq embedding error: @error', ['@error' => $error_msg], WATCHDOG_WARNING);
         }
       }
