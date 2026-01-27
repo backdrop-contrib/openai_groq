@@ -571,19 +571,36 @@ class GroqAdapter implements AIClientInterface {
   }
 
   public function embedding(string $input, string $model, bool $log = TRUE): array {
+    $start_time = microtime(TRUE);
     try {
       // Attempt SDK path
       $resp = $this->client->embeddings()->create([
         'model' => $model,
         'input' => $input,
       ]);
+      $result = [];
       if (method_exists($resp, 'toArray')) {
-        $resp = $resp->toArray();
+        $result = $resp->toArray();
       }
-      return $resp['data'][0]['embedding'] ?? [];
+      $vector = $result['data'][0]['embedding'] ?? [];
+      if (isset($this->api) && method_exists($this->api, 'recordLog')) {
+        $duration = microtime(TRUE) - $start_time;
+        $this->api->recordLog('embedding', $model, ['input' => $input], $result, TRUE, $duration, NULL, !$log);
+      }
+      return $vector;
     }
     catch (\Exception $e) {
-      watchdog('openai_groq', 'Groq embedding error: @error', ['@error' => $e->getMessage()], WATCHDOG_WARNING);
+      if (isset($this->api) && method_exists($this->api, 'recordLog')) {
+        $duration = microtime(TRUE) - $start_time;
+        $this->api->recordLog('embedding', $model, ['input' => $input], NULL, FALSE, $duration, $e->getMessage(), !$log);
+      }
+      if ($log) {
+        $error_msg = $e->getMessage();
+        // Suppress log if it's a "does not support embeddings" or similar during probing.
+        if (strpos($error_msg, 'does not support embeddings') === FALSE && strpos($error_msg, 'not found') === FALSE) {
+          watchdog('openai_groq', 'Groq embedding error: @error', ['@error' => $error_msg], WATCHDOG_WARNING);
+        }
+      }
       return [];
     }
   }
