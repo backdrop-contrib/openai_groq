@@ -632,7 +632,7 @@ class GroqAdapter implements AIClientInterface {
       if (empty($vector) || !is_array($vector)) {
         if (isset($this->api) && method_exists($this->api, 'recordLog')) {
           $duration = microtime(TRUE) - $start_time;
-          $log_payload = $result ?? ['raw' => is_scalar($raw_resp) ? $raw_resp : json_decode(json_encode($raw_resp), TRUE)];
+          $log_payload = $result ?: ['raw' => is_scalar($raw_resp) ? $raw_resp : json_decode(json_encode($raw_resp), TRUE)];
           $this->api->recordLog('embedding', $model, ['input' => $input], $log_payload, FALSE, $duration, 'Failed to extract embedding vector from response', !$log);
         }
         return [];
